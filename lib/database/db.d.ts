@@ -126,7 +126,7 @@ export interface Devices {
 	/**
 	 * TRUE when the device sent the `temperature-profile: true` request header on its last /api/display call. NULL until the device has been seen.
 	 */
-	supports_temperature_profile: Generated<boolean | null>;
+	supports_temperature_profile: boolean | null;
 	/**
 	 * Display tuning profile sent to the firmware in the /api/display response (default|a|b|c).
 	 */
@@ -185,30 +185,30 @@ export interface PlaylistItems {
 	start_time: string | null;
 }
 
-export interface PluginSettings {
-	created_at: Generated<Timestamp | null>;
-	fields: Generated<JsonObject>;
-	icon_content_type: string | null;
-	icon_url: string | null;
-	id: Generated<Int8>;
-	markup: Generated<JsonObject>;
-	merge_variables: Generated<JsonObject>;
-	name: string;
-	plugin_id: number;
-	read_only: Generated<boolean>;
-	settings_yaml: string | null;
-	strategy: string | null;
-	updated_at: Generated<Timestamp | null>;
-	user_id: string;
-	uuid: string;
-}
-
 export interface Playlists {
 	created_at: Generated<Timestamp | null>;
 	id: Generated<string>;
 	name: string;
 	updated_at: Generated<Timestamp | null>;
 	user_id: string | null;
+}
+
+export interface PluginSettings {
+	created_at: Generated<Timestamp | null>;
+	fields: Generated<Json>;
+	icon_content_type: string | null;
+	icon_url: string | null;
+	id: Generated<Int8>;
+	markup: Generated<Json>;
+	merge_variables: Generated<Json>;
+	name: string;
+	plugin_id: number;
+	read_only: Generated<boolean>;
+	settings_yaml: string | null;
+	strategy: Generated<string | null>;
+	updated_at: Generated<Timestamp | null>;
+	user_id: string;
+	uuid: string;
 }
 
 export interface RecipeFiles {
@@ -228,7 +228,7 @@ export interface Recipes {
 	description: string | null;
 	id: Generated<string>;
 	logo_url: string | null;
-	metadata: Generated<JsonObject | null>;
+	metadata: Generated<Json | null>;
 	name: string;
 	repo: string | null;
 	screenshot_url: string | null;
@@ -239,6 +239,12 @@ export interface Recipes {
 	version: string | null;
 	zip_entry_path: string | null;
 	zip_url: string | null;
+}
+
+export interface SchemaMigrations {
+	applied_at: Generated<Timestamp>;
+	checksum: string;
+	name: string;
 }
 
 export interface ScreenConfigs {
@@ -275,6 +281,39 @@ export interface SystemLogs {
 	trace: string | null;
 }
 
+export interface TokenUsageEvents {
+	agent_id: string | null;
+	cache_creation_input_tokens: Generated<Int8>;
+	cache_read_input_tokens: Generated<Int8>;
+	/**
+	 * When the row was ingested. Compare against ts to measure emitter lag.
+	 */
+	created_at: Generated<Timestamp>;
+	/**
+	 * Emitter-assigned record id. Unique, so a replayed ingest batch is a no-op via ON CONFLICT (event_id) DO NOTHING.
+	 */
+	event_id: string;
+	id: Generated<string>;
+	input_tokens: Generated<Int8>;
+	/**
+	 * TRUE for subagent/sidechain calls. The token-usage recipe can exclude these from its totals.
+	 */
+	is_sidechain: Generated<boolean>;
+	model: string;
+	output_tokens: Generated<Int8>;
+	prompt_id: string | null;
+	session_id: string;
+	/**
+	 * Generated sum of the four counters. The value the token-usage recipe sorts models by.
+	 */
+	total_tokens: Generated<Int8 | null>;
+	/**
+	 * When the model call happened, as reported by the emitter (ISO-8601 UTC on the wire).
+	 */
+	ts: Timestamp;
+	user_id: string | null;
+}
+
 export interface User {
 	banExpires: Timestamp | null;
 	banned: Generated<boolean | null>;
@@ -306,13 +345,15 @@ export interface DB {
 	mixups: Mixups;
 	pending_device_claims: PendingDeviceClaims;
 	playlist_items: PlaylistItems;
-	plugin_settings: PluginSettings;
 	playlists: Playlists;
+	plugin_settings: PluginSettings;
 	recipe_files: RecipeFiles;
 	recipes: Recipes;
+	schema_migrations: SchemaMigrations;
 	screen_configs: ScreenConfigs;
 	session: Session;
 	system_logs: SystemLogs;
+	token_usage_events: TokenUsageEvents;
 	user: User;
 	verification: Verification;
 }

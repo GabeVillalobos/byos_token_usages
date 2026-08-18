@@ -40,7 +40,7 @@ export default async function RecipePreviewPage({
 	} = await searchParams;
 	const userId = consumeBrowserRenderContext(renderToken);
 
-	const resolved = await resolveReactRecipe(slug, userId ?? undefined);
+	const resolved = await resolveReactRecipe(slug, userId ?? undefined, true);
 	if (!resolved) notFound();
 
 	const width = widthParam ? Number.parseInt(widthParam, 10) : undefined;

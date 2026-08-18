@@ -1,6 +1,6 @@
 import React, { type CSSProperties } from "react";
 import { twMerge } from "tailwind-merge";
-import { ditherPatterns } from "./dither-patterns";
+import { ditherPatterns, ditherStyle } from "./dither-patterns";
 
 const BREAKPOINTS = {
 	sm: 640,
@@ -162,9 +162,9 @@ export function processDither(className: string): {
 
 	for (const token of tokens) {
 		if (token.startsWith("dither-")) {
-			const ditherStyle = ditherPatterns[token];
-			if (ditherStyle) {
-				Object.assign(style, ditherStyle);
+			const pattern = ditherPatterns[token];
+			if (pattern) {
+				Object.assign(style, ditherStyle(token.slice("dither-".length)));
 			} else {
 				remainingClasses.push(token);
 			}

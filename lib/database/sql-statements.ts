@@ -1329,6 +1329,187 @@ CREATE POLICY plugin_settings_capability_select_policy ON plugin_settings
         AND uuid = (select current_setting('app.capability_lookup_uuid', true))
     );`,
 	},
+	"0022_schema_for_token_data": {
+		title: "Add Token Usage Events",
+		description:
+			"Creates token_usage_events, the per-request LLM token accounting table read by the token-usage recipe. Includes RLS policies, byos_app grants, and indexes for time-window queries and retention pruning.",
+		sql: `-- =============================================================================
+-- Part 1: Create token_usage_events table
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS token_usage_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- The emitter's own record id, kept separate from the surrogate key so
+    -- ingestion can be replayed: INSERT ... ON CONFLICT (event_id) DO NOTHING.
+    -- Uniqueness is global rather than per-tenant because emitter ids are
+    -- opaque and already unique. A per-tenant key would need the pair of
+    -- partial indexes that \`recipes\` uses for slugs, since a NULL user_id
+    -- defeats a plain composite UNIQUE.
+    event_id TEXT NOT NULL,
+
+    ts TIMESTAMPTZ NOT NULL,
+    session_id TEXT NOT NULL,
+    prompt_id TEXT,
+    agent_id TEXT,
+    is_sidechain BOOLEAN NOT NULL DEFAULT FALSE,
+
+    -- Free text, deliberately not an enum: a new model id must not require a
+    -- migration to start recording usage against it.
+    model TEXT NOT NULL,
+
+    -- BIGINT rather than INTEGER. A single request fits in INTEGER, but SUM()
+    -- widens to BIGINT anyway, so this removes the question entirely.
+    input_tokens BIGINT NOT NULL DEFAULT 0,
+    output_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_creation_input_tokens BIGINT NOT NULL DEFAULT 0,
+    cache_read_input_tokens BIGINT NOT NULL DEFAULT 0,
+
+    -- One definition of "total" for every consumer, instead of four re-derivations.
+    total_tokens BIGINT GENERATED ALWAYS AS (
+        input_tokens
+        + output_tokens
+        + cache_creation_input_tokens
+        + cache_read_input_tokens
+    ) STORED,
+
+    user_id TEXT REFERENCES "user"("id") ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- A bad emitter must not be able to write negatives that would silently
+    -- distort a chart segment.
+    CONSTRAINT token_usage_events_counters_non_negative CHECK (
+        input_tokens >= 0
+        AND output_tokens >= 0
+        AND cache_creation_input_tokens >= 0
+        AND cache_read_input_tokens >= 0
+    ),
+
+    CONSTRAINT token_usage_events_event_id_key UNIQUE (event_id)
+);
+
+COMMENT ON TABLE token_usage_events IS 'Per-request LLM token accounting. One row per model call; grouped by model and summed by the token-usage recipe.';
+COMMENT ON COLUMN token_usage_events.event_id IS 'Emitter-assigned record id. Unique, so a replayed ingest batch is a no-op via ON CONFLICT (event_id) DO NOTHING.';
+COMMENT ON COLUMN token_usage_events.ts IS 'When the model call happened, as reported by the emitter (ISO-8601 UTC on the wire).';
+COMMENT ON COLUMN token_usage_events.created_at IS 'When the row was ingested. Compare against ts to measure emitter lag.';
+COMMENT ON COLUMN token_usage_events.is_sidechain IS 'TRUE for subagent/sidechain calls. The token-usage recipe can exclude these from its totals.';
+COMMENT ON COLUMN token_usage_events.total_tokens IS 'Generated sum of the four counters. The value the token-usage recipe sorts models by.';
+
+-- =============================================================================
+-- Part 2: Indexes
+-- =============================================================================
+
+-- The recipe's access path: scope to the tenant, then walk a ts window backwards.
+CREATE INDEX IF NOT EXISTS token_usage_events_user_ts_idx
+    ON token_usage_events (user_id, ts DESC);
+
+-- Tenant-agnostic time scans: retention pruning and cross-tenant rollups.
+CREATE INDEX IF NOT EXISTS token_usage_events_ts_idx
+    ON token_usage_events (ts DESC);
+
+-- Session drill-down ("where did this conversation's tokens go").
+CREATE INDEX IF NOT EXISTS token_usage_events_session_idx
+    ON token_usage_events (session_id);
+
+-- Intentionally no index on model or is_sidechain. Both have a handful of
+-- distinct values, so the planner would ignore them; the GROUP BY reads the
+-- ts range regardless.
+
+-- =============================================================================
+-- Part 3: Row Level Security
+-- =============================================================================
+
+ALTER TABLE token_usage_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE token_usage_events FORCE ROW LEVEL SECURITY;
+
+-- Session lookups are wrapped as (select current_setting(...)) so Postgres
+-- evaluates them once per statement as an InitPlan rather than once per row,
+-- matching the form every other tenant policy was rewritten to in 0021.
+
+DROP POLICY IF EXISTS token_usage_events_select_policy ON token_usage_events;
+CREATE POLICY token_usage_events_select_policy ON token_usage_events
+    FOR SELECT
+    USING (user_id = (select current_setting('app.current_user_id', true)) OR user_id IS NULL);
+
+DROP POLICY IF EXISTS token_usage_events_insert_policy ON token_usage_events;
+CREATE POLICY token_usage_events_insert_policy ON token_usage_events
+    FOR INSERT
+    WITH CHECK (user_id = (select current_setting('app.current_user_id', true)));
+
+DROP POLICY IF EXISTS token_usage_events_update_policy ON token_usage_events;
+CREATE POLICY token_usage_events_update_policy ON token_usage_events
+    FOR UPDATE
+    USING (user_id = (select current_setting('app.current_user_id', true)))
+    WITH CHECK (user_id = (select current_setting('app.current_user_id', true)));
+
+DROP POLICY IF EXISTS token_usage_events_delete_policy ON token_usage_events;
+CREATE POLICY token_usage_events_delete_policy ON token_usage_events
+    FOR DELETE
+    USING (user_id = (select current_setting('app.current_user_id', true)));
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON token_usage_events TO byos_app;
+
+-- =============================================================================
+-- Part 4: Retention
+-- =============================================================================
+
+-- This table grows one row per model call, so it needs pruning eventually.
+-- Nothing in this repo schedules jobs, so no retention policy is installed here.
+-- token_usage_events_ts_idx makes the delete cheap when someone runs it:
+--
+--   DELETE FROM token_usage_events WHERE ts < NOW() - INTERVAL '90 days';`,
+	},
+	"0023_scope_token_usage_to_device_api_key": {
+		title: "Scope Token Usage Events to Device Access Tokens",
+		description:
+			"Adds device-api-key RLS policies to token_usage_events so a device authenticated by its Access-Token can insert and read usage rows belonging to its owner, without a browser session.",
+		sql: `-- =============================================================================
+-- Device access-token policies
+--
+-- Ingestion arrives as a device Access-Token, not a session: the connection has
+-- \`app.device_api_key\` set and \`app.current_user_id\` empty, so the 0022 tenant
+-- policies can never match. These policies are additive — Postgres ORs them
+-- with the existing ones — so the session-scoped dashboard reads are unchanged.
+--
+-- Rows stay bound to the device owner rather than being admitted with a NULL
+-- user_id: 0022's select policy treats \`user_id IS NULL\` as shared data, so an
+-- untenanted usage row would be readable by every tenant.
+--
+-- The devices lookup resolves under the same setting via
+-- devices_api_key_select_policy (0019, rewritten in 0021). Session lookups are
+-- wrapped as (select current_setting(...)) so Postgres evaluates them once per
+-- statement as an InitPlan, matching the form used by every policy since 0021.
+-- =============================================================================
+
+DROP POLICY IF EXISTS token_usage_events_api_key_select_policy ON token_usage_events;
+CREATE POLICY token_usage_events_api_key_select_policy ON token_usage_events
+    FOR SELECT
+    USING (
+        (select current_setting('app.device_api_key', true)) <> ''
+        AND EXISTS (
+            SELECT 1
+            FROM devices d
+            WHERE d.api_key = (select current_setting('app.device_api_key', true))
+                AND d.user_id = token_usage_events.user_id
+        )
+    );
+
+DROP POLICY IF EXISTS token_usage_events_api_key_insert_policy ON token_usage_events;
+CREATE POLICY token_usage_events_api_key_insert_policy ON token_usage_events
+    FOR INSERT
+    WITH CHECK (
+        (select current_setting('app.device_api_key', true)) <> ''
+        AND EXISTS (
+            SELECT 1
+            FROM devices d
+            WHERE d.api_key = (select current_setting('app.device_api_key', true))
+                AND d.user_id = token_usage_events.user_id
+        )
+    );
+
+-- Deliberately no UPDATE or DELETE policy: a device only ever appends usage.
+-- Editing and pruning stay on the session-scoped path from 0022.`,
+	},
 	validate_schema: {
 		title: "Validate Database Schema",
 		description:
@@ -1337,7 +1518,7 @@ CREATE POLICY plugin_settings_capability_select_policy ON plugin_settings
 -- Returns empty result if all tables exist, or rows with missing table names if any are missing
 SELECT 
   expected_table as missing_table
-FROM unnest(ARRAY['account', 'devices', 'logs', 'mixup_slots', 'mixups', 'pending_device_claims', 'playlist_items', 'playlists', 'plugin_settings', 'recipe_files', 'recipes', 'schema_migrations', 'screen_configs', 'session', 'system_logs', 'user', 'verification']::text[]) as expected_table
+FROM unnest(ARRAY['account', 'devices', 'logs', 'mixup_slots', 'mixups', 'pending_device_claims', 'playlist_items', 'playlists', 'plugin_settings', 'recipe_files', 'recipes', 'schema_migrations', 'screen_configs', 'session', 'system_logs', 'token_usage_events', 'user', 'verification']::text[]) as expected_table
 WHERE NOT EXISTS (
   SELECT 1 
   FROM information_schema.tables 

@@ -21,6 +21,8 @@ export const reactRecipeLoaders: Record<string, RecipeModuleLoader> = {
 		),
 	"simple-text": () =>
 		import("../../app/(app)/recipes/screens/simple-text/simple-text"),
+	"token-usage": () =>
+		import("../../app/(app)/recipes/screens/token-usage/token-usage"),
 	weather: () => import("../../app/(app)/recipes/screens/weather/weather"),
 	wikipedia: () =>
 		import("../../app/(app)/recipes/screens/wikipedia/wikipedia"),
@@ -36,6 +38,7 @@ export const reactRecipeSlugs = [
 	"not-found",
 	"responsive-example",
 	"simple-text",
+	"token-usage",
 	"weather",
 	"wikipedia",
 ] as const;
