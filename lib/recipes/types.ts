@@ -44,6 +44,33 @@ export type RecipeRenderProps = {
 };
 
 /**
+ * Ambient context the runtime passes to `getData` alongside the user's params.
+ *
+ * `userId` is the tenant this render belongs to. It is deliberately supplied
+ * rather than resolved inside `getData`, because it is not always the session
+ * user: device requests authenticate with an `Access-Token` and carry no
+ * session, so the bitmap route resolves the owner from the key and hands it
+ * down. A `getData` that reads tenant-scoped rows must use this value —
+ * resolving the user from the session itself would read the wrong tenant (or
+ * nothing) on device renders.
+ *
+ * Undefined means no tenant was resolved; treat it the way `getScreenParams`
+ * does and fall back to the session scope.
+ */
+export type RecipeDataContext = {
+	userId?: string;
+	/**
+	 * True only for the in-browser React preview at `/recipes/{slug}/preview`.
+	 * Device renders and the `/api/bitmap` path leave it unset, so a recipe that
+	 * branches on it still serves real data to hardware. Recipes are free to
+	 * ignore it; it exists for feeds whose live read is unwanted while
+	 * previewing (cost, rate limits, or an empty tenant showing as a blank
+	 * screen).
+	 */
+	preview?: boolean;
+};
+
+/**
  * Single source of truth for a built-in React recipe.
  *
  * - `paramsSchema` describes user-configurable inputs (drives the form and
@@ -52,7 +79,9 @@ export type RecipeRenderProps = {
  * - `dataSchema` describes the shape the component actually renders against.
  *   For recipes with no fetch, `dataSchema = paramsSchema`. For data-driven
  *   recipes (wikipedia, weather, …), `dataSchema` describes the fetched
- *   payload and `getData(params)` produces it.
+ *   payload and `getData(params, context)` produces it. Recipes that need
+ *   neither the tenant nor anything else ambient can declare `getData` with a
+ *   single `params` argument and ignore the second.
  * - `Component` receives `{ width, height, params, data }` so the runtime can
  *   pass both the user's saved params AND the data the component should
  *   render against, without flattening either.
@@ -64,7 +93,10 @@ export type RecipeDefinition<
 	meta: RecipeMeta;
 	paramsSchema: P;
 	dataSchema: D;
-	getData?: (params: z.infer<P>) => Promise<z.infer<D>>;
+	getData?: (
+		params: z.infer<P>,
+		context: RecipeDataContext,
+	) => Promise<z.infer<D>>;
 	Component: ComponentType<
 		RecipeRenderProps & {
 			params: z.infer<P>;

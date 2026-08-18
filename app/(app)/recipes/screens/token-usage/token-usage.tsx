@@ -31,16 +31,6 @@ export const paramsSchema = z.object({
 		.default("Token Usage")
 		.describe("Heading shown in the top-right corner of the screen.")
 		.meta({ title: "Title", placeholder: "Token Usage" }),
-	sourceUrl: z
-		.string()
-		.default("")
-		.describe(
-			"URL returning usage records as a JSON array, an { entries: [...] } object, or NDJSON. Leave blank to render sample data.",
-		)
-		.meta({
-			title: "Usage Feed URL",
-			placeholder: "https://example.com/usage.json",
-		}),
 	lookbackHours: z.coerce
 		.number()
 		.default(0)
@@ -299,12 +289,14 @@ export const definition: RecipeDefinition<
 	},
 	paramsSchema,
 	dataSchema,
-	getData: async (params) => {
-		const data = await getTokenUsageData({
-			sourceUrl: params.sourceUrl,
-			lookbackHours: params.lookbackHours,
-			includeSidechains: params.includeSidechains,
-		});
+	getData: async (params, context) => {
+		const data = await getTokenUsageData(
+			{
+				lookbackHours: params.lookbackHours,
+				includeSidechains: params.includeSidechains,
+			},
+			context,
+		);
 		return data as z.infer<typeof dataSchema>;
 	},
 	Component: ({ width, height, screen, params, data }) => (

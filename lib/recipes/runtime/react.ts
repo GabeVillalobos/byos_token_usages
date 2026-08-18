@@ -2,7 +2,10 @@ import { cache } from "react";
 import { z } from "zod";
 import { getScreenParams } from "@/app/actions/screens-params";
 import { getReactRecipeDefinition } from "@/lib/recipes/registry";
-import type { AnyRecipeDefinition } from "@/lib/recipes/types";
+import type {
+	AnyRecipeDefinition,
+	RecipeDataContext,
+} from "@/lib/recipes/types";
 import { zodObjectToParamDefinitions } from "@/lib/recipes/zod-form";
 
 /**
@@ -77,9 +80,10 @@ function safeParseDataWithDefaults(
 async function callGetDataWithTimeout(
 	getData: NonNullable<AnyRecipeDefinition["getData"]>,
 	params: Record<string, unknown>,
+	context: RecipeDataContext,
 ): Promise<unknown> {
 	return await Promise.race([
-		getData(params),
+		getData(params, context),
 		new Promise((_, reject) => {
 			setTimeout(
 				() => reject(new Error("Recipe data fetch timeout")),
@@ -89,10 +93,16 @@ async function callGetDataWithTimeout(
 	]);
 }
 
+/**
+ * `preview` is a positional boolean rather than an options object because
+ * `cache` keys on argument identity: a fresh object literal per call would
+ * memoize nothing.
+ */
 export const resolveReactRecipe = cache(
 	async (
 		slug: string,
 		userId?: string,
+		preview?: boolean,
 	): Promise<ResolvedReactRecipe | null> => {
 		const definition = await getReactRecipeDefinition(slug);
 		if (!definition) return null;
@@ -119,6 +129,7 @@ export const resolveReactRecipe = cache(
 				const fetched = await callGetDataWithTimeout(
 					definition.getData,
 					params,
+					{ userId, preview },
 				);
 				data = safeParseDataWithDefaults(definition.dataSchema, fetched);
 			} catch (error) {

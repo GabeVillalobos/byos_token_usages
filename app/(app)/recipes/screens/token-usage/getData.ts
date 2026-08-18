@@ -1,20 +1,22 @@
-import { unstable_cache } from "next/cache";
-import { z } from "zod";
+import { withExplicitUserScope, withUserScope } from "@/lib/database/scoped-db";
+import { checkDbConnection } from "@/lib/database/utils";
+import type { RecipeDataContext } from "@/lib/recipes/types";
 import type { TokenUsageEntry } from "./aggregate";
 
 // Usage data is live; never serve a statically-rendered snapshot.
 export const dynamic = "force-dynamic";
 
 /**
- * The transport seam for the token-usage recipe.
+ * Reads token usage from `token_usage_events` (migration 0022).
  *
- * Everything downstream (`aggregate.ts`, the screen component) consumes raw
- * entries, so moving the source from an HTTP feed to a Postgres query means
- * replacing `fetchEntries` alone.
+ * Rows are returned raw and aggregated in `aggregate.ts`, because the grouping
+ * has to fold its tail into an "Other" row at a row count that depends on the
+ * screen height — something this layer never sees. The `ts` window and the
+ * sidechain filter are still applied in SQL so the read stays bounded; the
+ * same filters in `aggregateUsage` are then no-ops on already-filtered rows.
  */
 
 export type TokenUsageParams = {
-	sourceUrl?: string;
 	lookbackHours?: number | string;
 	includeSidechains?: boolean;
 };
@@ -25,32 +27,22 @@ export type TokenUsageFetchResult = {
 	sourceLabel: string;
 };
 
-/** Well under the runtime's 10s hard cap in `lib/recipes/runtime/react.ts`. */
-const FETCH_TIMEOUT_MS = 7_000;
-
 /**
- * Counters are optional so a partial record still contributes what it has;
- * `aggregate.ts` treats missing values as zero either way.
+ * Ceiling on rows pulled into memory per render. Ordering is `ts DESC`, so
+ * hitting the cap drops the oldest events in the window rather than a random
+ * slice — and `sourceLabel` says so instead of quietly under-reporting.
  */
-const usageEntrySchema = z.object({
-	id: z.string().default(""),
-	ts: z.string().default(""),
-	session_id: z.string().default(""),
-	prompt_id: z.string().nullable().default(null),
-	agent_id: z.string().nullable().default(null),
-	is_sidechain: z.boolean().default(false),
-	model: z.string().default("unknown"),
-	input_tokens: z.number().default(0),
-	output_tokens: z.number().default(0),
-	cache_creation_input_tokens: z.number().default(0),
-	cache_read_input_tokens: z.number().default(0),
-});
+const MAX_EVENTS = 5_000;
+
+export const SAMPLE_SOURCE_LABEL = "Sample data";
+const LIVE_SOURCE_LABEL = "token_usage_events";
 
 /**
- * Rendered whenever no source is configured or the fetch fails, so the recipe
- * shows a meaningful screen the moment it appears in the catalog. Spread over
- * a few hours and models so the lookback and sidechain params visibly do
- * something during authoring.
+ * Rendered for the in-browser preview, and when the database is unreachable or
+ * un-migrated so `/recipes/token-usage` still previews in the README's no-DB
+ * mode. On the device path a reachable-but-empty table deliberately falls
+ * through to the component's "No usage in this window" state rather than
+ * inventing numbers.
  */
 const SAMPLE_ENTRIES: TokenUsageEntry[] = [
 	{
@@ -146,77 +138,111 @@ const SAMPLE_ENTRIES: TokenUsageEntry[] = [
 	},
 ];
 
-export const SAMPLE_SOURCE_LABEL = "Sample data";
+/** A row as Kysely hands it back, before wire types are normalised. */
+type UsageRow = {
+	event_id: string;
+	ts: Date | string;
+	session_id: string;
+	prompt_id: string | null;
+	agent_id: string | null;
+	is_sidechain: boolean;
+	model: string;
+	input_tokens: string | number | bigint;
+	output_tokens: string | number | bigint;
+	cache_creation_input_tokens: string | number | bigint;
+	cache_read_input_tokens: string | number | bigint;
+};
+
+/** `bigint` columns arrive from node-postgres as strings; `dataSchema` wants numbers. */
+function toNumber(value: string | number | bigint): number {
+	const n = Number(value);
+	return Number.isFinite(n) ? n : 0;
+}
+
+function toEntry(row: UsageRow): TokenUsageEntry {
+	return {
+		// The recipe's entry shape keys off the emitter's own id, not the
+		// table's surrogate UUID.
+		id: row.event_id,
+		ts: row.ts instanceof Date ? row.ts.toISOString() : String(row.ts),
+		session_id: row.session_id,
+		prompt_id: row.prompt_id,
+		agent_id: row.agent_id,
+		is_sidechain: row.is_sidechain,
+		model: row.model,
+		input_tokens: toNumber(row.input_tokens),
+		output_tokens: toNumber(row.output_tokens),
+		cache_creation_input_tokens: toNumber(row.cache_creation_input_tokens),
+		cache_read_input_tokens: toNumber(row.cache_read_input_tokens),
+	};
+}
+
+function normalizeLookbackHours(value: number | string | undefined): number {
+	const n = typeof value === "number" ? value : Number(value);
+	return Number.isFinite(n) && n > 0 ? n : 0;
+}
 
 /**
- * Accept the three shapes a usage feed plausibly arrives in: a bare JSON
- * array, an envelope with an `entries`/`data` array, or NDJSON (one record per
- * line). Rows that fail validation are skipped rather than failing the render.
+ * Not wrapped in `unstable_cache`: this is a local indexed read, and the
+ * no-explicit-userId path resolves the session through `headers()`, which
+ * throws inside a cache scope. `getScreenParams` — the other DB read in this
+ * same render pipeline — is uncached for the same reason.
  */
-export function parseEntries(body: string): TokenUsageEntry[] {
-	const trimmed = body.trim();
-	if (!trimmed) return [];
+async function fetchEntries({
+	userId,
+	lookbackHours,
+	includeSidechains,
+}: {
+	userId?: string;
+	lookbackHours: number;
+	includeSidechains: boolean;
+}): Promise<{ entries: TokenUsageEntry[]; truncated: boolean }> {
+	const query = (
+		scopedDb: Parameters<Parameters<typeof withUserScope>[0]>[0],
+	) => {
+		let builder = scopedDb
+			.selectFrom("token_usage_events")
+			.select([
+				"event_id",
+				"ts",
+				"session_id",
+				"prompt_id",
+				"agent_id",
+				"is_sidechain",
+				"model",
+				"input_tokens",
+				"output_tokens",
+				"cache_creation_input_tokens",
+				"cache_read_input_tokens",
+			]);
 
-	const candidates: unknown[] = [];
-	try {
-		const parsed = JSON.parse(trimmed);
-		if (Array.isArray(parsed)) {
-			candidates.push(...parsed);
-		} else if (parsed && typeof parsed === "object") {
-			const envelope = parsed as Record<string, unknown>;
-			const list = envelope.entries ?? envelope.data ?? envelope.rows;
-			if (Array.isArray(list)) candidates.push(...list);
-			else candidates.push(parsed);
+		if (lookbackHours > 0) {
+			builder = builder.where(
+				"ts",
+				">=",
+				new Date(Date.now() - lookbackHours * 3_600_000),
+			);
 		}
-	} catch {
-		// Not a single JSON document — try NDJSON/JSONL.
-		for (const line of trimmed.split("\n")) {
-			const value = line.trim();
-			if (!value) continue;
-			try {
-				candidates.push(JSON.parse(value));
-			} catch {
-				// Skip malformed lines.
-			}
+		if (!includeSidechains) {
+			builder = builder.where("is_sidechain", "=", false);
 		}
-	}
 
-	const entries: TokenUsageEntry[] = [];
-	for (const candidate of candidates) {
-		const result = usageEntrySchema.safeParse(candidate);
-		if (result.success) entries.push(result.data);
-	}
-	return entries;
-}
+		// One past the cap, so a full page is distinguishable from an exact fit.
+		return builder
+			.orderBy("ts", "desc")
+			.limit(MAX_EVENTS + 1)
+			.execute();
+	};
 
-/** Replace this body with a Postgres query when the table lands. */
-async function fetchEntries(sourceUrl: string): Promise<TokenUsageEntry[]> {
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-	try {
-		const response = await fetch(sourceUrl, {
-			signal: controller.signal,
-			headers: { Accept: "application/json, application/x-ndjson, text/plain" },
-		});
-		if (!response.ok) {
-			throw new Error(`Usage feed responded ${response.status}`);
-		}
-		const entries = parseEntries(await response.text());
-		if (entries.length === 0) {
-			throw new Error("Usage feed returned no usable entries");
-		}
-		return entries;
-	} finally {
-		clearTimeout(timeout);
-	}
-}
+	const rows = userId
+		? await withExplicitUserScope(userId, query)
+		: await withUserScope(query);
 
-function hostLabel(sourceUrl: string): string {
-	try {
-		return new URL(sourceUrl).hostname;
-	} catch {
-		return "Usage feed";
-	}
+	const truncated = rows.length > MAX_EVENTS;
+	return {
+		entries: rows.slice(0, MAX_EVENTS).map((row) => toEntry(row as UsageRow)),
+		truncated,
+	};
 }
 
 function formatFetchedAt(): string {
@@ -228,10 +254,27 @@ function formatFetchedAt(): string {
 
 export default async function getData(
 	params?: TokenUsageParams,
+	context?: RecipeDataContext,
 ): Promise<TokenUsageFetchResult> {
-	const sourceUrl = params?.sourceUrl?.trim() ?? "";
+	// The preview is a layout surface: it renders whatever tenant happens to be
+	// signed in, which is empty as often as not, and the reader cannot tell a
+	// working chart from a broken one. Fixed sample data keeps it legible and
+	// keeps a design tweak from costing a query. Devices are unaffected — only
+	// `/recipes/{slug}/preview` sets this flag.
+	if (context?.preview) {
+		return {
+			entries: SAMPLE_ENTRIES,
+			fetchedAt: formatFetchedAt(),
+			sourceLabel: SAMPLE_SOURCE_LABEL,
+		};
+	}
 
-	if (!sourceUrl) {
+	const { ready, error } = await checkDbConnection();
+	if (!ready) {
+		console.warn(
+			"[recipe:token-usage] database not ready, using sample data:",
+			error,
+		);
 		return {
 			entries: SAMPLE_ENTRIES,
 			fetchedAt: formatFetchedAt(),
@@ -240,22 +283,33 @@ export default async function getData(
 	}
 
 	try {
-		const cached = unstable_cache(
-			() => fetchEntries(sourceUrl),
-			["token-usage-feed", sourceUrl],
-			{ tags: ["token-usage", sourceUrl], revalidate: 300 },
-		);
+		const { entries, truncated } = await fetchEntries({
+			userId: context?.userId,
+			lookbackHours: normalizeLookbackHours(params?.lookbackHours),
+			includeSidechains: params?.includeSidechains ?? true,
+		});
+
+		if (truncated) {
+			console.warn(
+				`[recipe:token-usage] window exceeds ${MAX_EVENTS} events; totals cover the most recent ${MAX_EVENTS}`,
+			);
+		}
+
 		return {
-			entries: await cached(),
+			entries,
 			fetchedAt: formatFetchedAt(),
-			sourceLabel: hostLabel(sourceUrl),
+			sourceLabel: truncated
+				? `${LIVE_SOURCE_LABEL} (latest ${MAX_EVENTS})`
+				: LIVE_SOURCE_LABEL,
 		};
-	} catch (error) {
-		console.error("Error fetching token usage:", error);
+	} catch (queryError) {
+		// A query failure is not a missing database, so do not pretend there is
+		// sample data — render the empty state and say the read failed.
+		console.error("[recipe:token-usage] usage query failed:", queryError);
 		return {
-			entries: SAMPLE_ENTRIES,
+			entries: [],
 			fetchedAt: formatFetchedAt(),
-			sourceLabel: SAMPLE_SOURCE_LABEL,
+			sourceLabel: "Usage query failed",
 		};
 	}
 }
