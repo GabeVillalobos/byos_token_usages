@@ -1,16 +1,33 @@
 // Dither pattern mapping
-export const ditherPatterns: Record<
-	string,
-	{
-		backgroundImage?: string;
-		background?: string;
-		backgroundSize?: string;
-		backgroundColor?: string;
-		backgroundRepeat?: string;
-		imageRendering?: "auto" | "pixelated" | "crisp-edges";
-		color?: string;
-	}
-> = {
+export type DitherStyle = {
+	backgroundImage?: string;
+	background?: string;
+	backgroundSize?: string;
+	backgroundColor?: string;
+	backgroundRepeat?: string;
+	backgroundClip?: "border-box" | "padding-box" | "content-box";
+	imageRendering?: "auto" | "pixelated" | "crisp-edges";
+	color?: string;
+};
+
+/**
+ * Base applied under every shade.
+ *
+ * `backgroundClip` is load-bearing, not a default: Takumi paints a repeating
+ * background as whole tiles and, under the default `border-box`, does not clip
+ * the trailing row and column to the element. A 13px box carrying an 8px
+ * pattern therefore bleeds 3px past its own edges, over whatever sits beside
+ * it. `padding-box` confines the fill exactly, at every size and at both
+ * render scales. `overflow: hidden` on the element itself does not do this —
+ * only a clipping ancestor or this property does.
+ */
+const ditherBase: DitherStyle = {
+	backgroundRepeat: "repeat",
+	backgroundClip: "padding-box",
+	imageRendering: "pixelated",
+};
+
+export const ditherPatterns: Record<string, DitherStyle> = {
 	"dither-0": { background: "white" },
 	"dither-15": {
 		backgroundImage:
@@ -118,8 +135,19 @@ export const ditherPatterns: Record<
 		color: "white",
 	},
 	"dither-1000": { background: "black", color: "white" },
-	dither: {
-		backgroundRepeat: "repeat",
-		imageRendering: "pixelated",
-	},
+	dither: ditherBase,
 };
+
+/**
+ * Inline style for a dither shade.
+ *
+ * Prefer this over a `dither-*` className anywhere the element is produced by a
+ * component rather than written directly inside `<PreSatori>`: the `PreSatori`
+ * transform only walks the JSX it is literally handed, so a class emitted from
+ * inside a component is never rewritten and the fill silently renders white.
+ */
+export function ditherStyle(shade: number | string): DitherStyle {
+	const pattern = ditherPatterns[`dither-${shade}`];
+	if (!pattern) return {};
+	return { ...ditherBase, ...pattern };
+}

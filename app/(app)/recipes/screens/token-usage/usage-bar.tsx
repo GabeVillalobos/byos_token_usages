@@ -1,5 +1,6 @@
 import { screenMetric } from "@/components/trmnl/screen-layout";
 import type { ScreenProfile } from "@/lib/trmnl/screen-profile";
+import { ditherStyle } from "@/utils/dither-patterns";
 import {
 	allocateSegmentWidths,
 	formatTokens,
@@ -11,10 +12,11 @@ import {
  * One `[ label ][ stacked track ][ total ]` row.
  *
  * Bars are plain flex divs with explicit pixel widths rather than SVG: the
- * renderer handles measured flow layout reliably, and `dither-*` fills survive
- * 1-bit quantization (see `bitmap-patterns`). Styles are inline because
- * Tailwind classes inside nested primitives are not reliably preprocessed by
- * `PreSatori` — only the `dither-*` class is, which is exactly what we want.
+ * renderer handles measured flow layout reliably, and dither fills survive
+ * 1-bit quantization (see `bitmap-patterns`). Everything is styled inline,
+ * including the fills: `PreSatori` only rewrites the JSX it is handed
+ * directly, so a `dither-*` className emitted from inside this component would
+ * never be turned into a background and the bars would render empty.
  */
 export function UsageBarRow({
 	screen,
@@ -93,8 +95,8 @@ export function UsageBarRow({
 					widths[index] > 0 ? (
 						<div
 							key={segment.key}
-							className={`dither-${segment.dither}`}
 							style={{
+								...ditherStyle(segment.dither),
 								display: "flex",
 								flex: "none",
 								width: widths[index],
@@ -160,8 +162,8 @@ export function UsageLegend({
 					}}
 				>
 					<div
-						className={`dither-${segment.dither}`}
 						style={{
+							...ditherStyle(segment.dither),
 							display: "flex",
 							flex: "none",
 							width: swatch,
