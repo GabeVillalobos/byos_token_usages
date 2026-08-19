@@ -10,13 +10,18 @@ import {
 	DEFAULT_DEVICE_SCREEN,
 	DEVICE_SLEEP_REFRESH_SECONDS,
 } from "@/lib/device/defaults";
+import { createOrRefreshPendingDeviceClaim } from "@/lib/device/pending-device-claims";
 import { createProvisionedDevice } from "@/lib/device/provisioning";
 import { logError, logInfo, logWarn } from "@/lib/logger";
 import {
 	type ModelStorageResolution,
 	resolveModelForStorage,
 } from "@/lib/trmnl/model-storage";
-import { generateApiKey, generateFriendlyId } from "@/utils/helpers";
+import {
+	generateApiKey,
+	generateFriendlyId,
+	generateRandomApiKey,
+} from "@/utils/helpers";
 
 function logUnknownSetupModel(
 	modelResolution: ModelStorageResolution,
@@ -50,6 +55,52 @@ async function resolveSetupUserId(
 	}
 
 	return getCurrentUserId();
+}
+
+/**
+ * A device that reaches setup without a resolvable owner gets credentials but no
+ * `devices` row: it is parked in `pending_device_claims` until a signed-in user
+ * enters the claim code it shows on screen. Issuing the access token here is what
+ * lets a factory-fresh device reach /api/display, which renders the same code.
+ */
+async function issueClaimCode(
+	macAddress: string,
+	model: string,
+	apiKey: string | null,
+): Promise<NextResponse> {
+	// Reuse a presented token so a device that was already provisioned (or whose
+	// device row was deleted) keeps one identity across setup retries.
+	const deviceApiKey = apiKey || generateRandomApiKey();
+	const friendlyId = generateFriendlyId(macAddress, deviceApiKey);
+	const { claimCode } = await createOrRefreshPendingDeviceClaim({
+		apiKey: deviceApiKey,
+		macAddress,
+		model,
+		width: null,
+		height: null,
+	});
+
+	logInfo("Issued claim code for unowned device", {
+		source: "api/setup",
+		metadata: {
+			friendly_id: friendlyId,
+			mac_address: macAddress,
+			model,
+			reused_access_token: Boolean(apiKey),
+		},
+	});
+
+	return NextResponse.json(
+		{
+			status: 200,
+			api_key: deviceApiKey,
+			friendly_id: friendlyId,
+			image_url: null,
+			filename: null,
+			message: `Device ${friendlyId} is waiting to be claimed. Enter claim code ${claimCode} in BYOS.`,
+		},
+		{ status: 200 },
+	);
 }
 
 export async function GET(request: Request) {
@@ -123,24 +174,7 @@ export async function GET(request: Request) {
 
 		const currentUserId = await resolveSetupUserId(apiKey);
 		if (!currentUserId) {
-			logError("Refusing to set up an unowned device", {
-				source: "api/setup",
-				metadata: {
-					macAddress,
-					hasApiKey: Boolean(apiKey),
-					model,
-				},
-			});
-			return NextResponse.json(
-				{
-					status: 403,
-					api_key: null,
-					friendly_id: null,
-					image_url: null,
-					message: "Device setup requires an authenticated owner",
-				},
-				{ status: 403 },
-			);
+			return issueClaimCode(macAddress, model, apiKey);
 		}
 
 		// First check if the device exists by MAC address

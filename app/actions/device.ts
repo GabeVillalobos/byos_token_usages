@@ -454,7 +454,6 @@ export async function claimDeviceByCode(input: {
 			const macAddress =
 				pendingClaim.mac_address ??
 				generateMockMacAddress(pendingClaim.api_key);
-			const timestamp = now.toISOString().replace(/[-:Z]/g, "");
 
 			if (existingDevice) {
 				const friendlyId = existingDevice.friendly_id;
@@ -473,7 +472,9 @@ export async function claimDeviceByCode(input: {
 				return { friendlyId };
 			}
 
-			const friendlyId = generateFriendlyId(macAddress, timestamp);
+			// Salted with the API key rather than the current time so the id matches
+			// the one /api/setup already reported to the device.
+			const friendlyId = generateFriendlyId(macAddress, pendingClaim.api_key);
 			await trx
 				.insertInto("devices")
 				.values({

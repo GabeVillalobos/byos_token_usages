@@ -5,6 +5,7 @@ import { resolveModelForStorage } from "@/lib/trmnl/model-storage";
 
 const CLAIM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const CLAIM_CODE_LENGTH = 8;
+const CLAIM_TTL_HOURS = 24;
 
 type PendingClaimInput = {
 	apiKey: string;
@@ -43,15 +44,14 @@ export function hashClaimCode(code: string): string {
 	return hmacHex("device-claim-lookup-v1", normalizeClaimCode(code));
 }
 
-export function generateClaimCode(input: PendingClaimInput): string {
-	const seed = [
-		input.apiKey,
-		input.macAddress ?? "",
-		input.model ?? "",
-		input.width ?? "",
-		input.height ?? "",
-	].join("\0");
-	const bytes = Buffer.from(hmacHex("device-claim-code-v1", seed), "hex");
+/**
+ * Derived from the API key alone so that a device gets the same code whether it
+ * was provisioned by /api/setup or first seen by /api/display, and so reported
+ * metadata changing (model, resolution) can't strand a device on a code that no
+ * longer maps to a stored row.
+ */
+export function generateClaimCode(apiKey: string): string {
+	const bytes = Buffer.from(hmacHex("device-claim-code-v1", apiKey), "hex");
 	let code = "";
 	for (let index = 0; index < CLAIM_CODE_LENGTH; index += 1) {
 		code += CLAIM_ALPHABET[bytes[index] % CLAIM_ALPHABET.length];
@@ -62,9 +62,11 @@ export function generateClaimCode(input: PendingClaimInput): string {
 export async function createOrRefreshPendingDeviceClaim(
 	input: PendingClaimInput,
 ): Promise<{ claimCode: string; claimHash: string }> {
-	const claimCode = generateClaimCode(input);
+	const claimCode = generateClaimCode(input.apiKey);
 	const claimHash = hashClaimCode(claimCode);
 	const modelResolution = await resolveModelForStorage(input.model);
+
+	await pruneStalePendingClaims();
 
 	await db
 		.insertInto("pending_device_claims")
@@ -92,4 +94,20 @@ export async function createOrRefreshPendingDeviceClaim(
 		.execute();
 
 	return { claimCode, claimHash };
+}
+
+/**
+ * Unclaimed devices are written here without any authentication, so rows are
+ * dropped once a device stops checking in. A device that comes back gets the
+ * same code again on its next callback, since the code is derived from its key.
+ */
+async function pruneStalePendingClaims(): Promise<void> {
+	await db
+		.deleteFrom("pending_device_claims")
+		.where(
+			"last_seen_at",
+			"<",
+			sql<Date>`NOW() - make_interval(hours => ${CLAIM_TTL_HOURS})`,
+		)
+		.execute();
 }
